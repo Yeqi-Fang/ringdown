@@ -4,6 +4,7 @@ import aesara.tensor as at
 import aesara.tensor.slinalg as atl
 import numpy as np
 import pymc as pm
+from scipy.special import binom
 
 # reference frequency and mass values to translate linearly between the two
 FREF = 2985.668287014743
@@ -106,6 +107,53 @@ def phiL_from_quadratures(Apx, Apy, Acx, Acy):
 def flat_A_quadratures_prior(Apx_unit, Apy_unit, Acx_unit, Acy_unit):
     return 0.5*at.sum(at.square(Apx_unit) + at.square(Apy_unit) +
                       at.square(Acx_unit) + at.square(Acy_unit))
+
+def spin_weighted_spherical_harmonic(s, l, m, theta):
+    """Compute the spin weighted spherical harmonics, of a given spin weight,
+    evaluated at certain polar angle, fixing the azimuthal angle to phi=0.
+
+    Arguments
+    ---------
+    s : int
+        spin weight (-2 for GWs)
+    l : int
+        total angular momentum number
+    m : int
+        azimuthal number, must have `|m| <= l`
+    theta : float
+        polar angle
+
+    Returns
+    -------
+    swsh : float
+        SWSH coefficient
+    """
+    prefac2 = (np.math.factorial(l + m)*np.math.factorial(l - m)*(2*l + 1))/\
+              (np.math.factorial(l + s)*np.math.factorial(l - s)*4*np.pi)
+    sin_th_2 = at.sin(theta/2)
+    cot_th_2 = at.cos(theta/2) / sin_th_2
+    itsum = 0.0
+    for r in range(l - s + 1):
+      itsum += binom(l-s, r)*binom(l+s, r+s-m)*(-1)**(l-r-s)*cot_th_2**(2*r+s-m)
+    return (-1)**m * np.sqrt(prefac2) * sin_th_2**(2*l) * itsum 
+
+def symmetric_swsh_pc(s, l, m, theta):
+    """Effective plus and cross SWSH factors assuming equatorial symmetry.
+
+    Returns
+    -------
+    Ylm_plus : float
+        prefactor for the plus polarization
+    Ylm_cross : float
+        prefactor for the cross polarization
+    """
+    Ylm_plus_m = spin_weighted_spherical_harmonic(s, l, m, theta)
+    Ylm_minus_m = spin_weighted_spherical_harmonic(s, l, m, np.pi - theta)
+    # TODO: double check missing (-1)**s
+    Ylm_plus = Ylm_plus_m + Ylm_minus_m
+    Ylm_cross = Ylm_plus_m - Ylm_minus_m
+    return Ylm_plus, Ylm_cross
+    
 
 def make_mchi_model(t0, times, strains, Ls, Fps, Fcs, f_coeffs, g_coeffs,
                     **kwargs):
@@ -251,7 +299,8 @@ def make_mchi_aligned_model(t0, times, strains, Ls, Fps, Fcs, f_coeffs,
     nmode = f_coeffs.shape[0]
 
     ifos = kwargs.pop('ifos', np.arange(ndet))
-    modes = kwargs.pop('modes', np.arange(nmode))
+    modes = kwargs.pop('modes')
+    lms = [(int(l), int(m))for (p,l,m,n) in [x.decode('ascii') for x in modes]]
 
     coords = {
         'ifo': ifos,
@@ -268,6 +317,12 @@ def make_mchi_aligned_model(t0, times, strains, Ls, Fps, Fcs, f_coeffs,
         chi = pm.Uniform("chi", chi_min, chi_max)
 
         cosi = pm.Uniform("cosi", cosi_min, cosi_max)
+        iota = at.arccos(cosi)
+
+        Ylm_plus_m = at.as_tensor_variable([spin_weighted_spherical_harmonic(-2, l, m, iota) for (l,m) in lms], ndim=1)
+        Ylm_minus_m = at.as_tensor_variable([spin_weighted_spherical_harmonic(-2, l, m, np.pi-iota) for (l,m) in lms], ndim=1)
+        Ylm_plus = Ylm_plus_m + Ylm_minus_m
+        Ylm_cross = Ylm_plus_m - Ylm_minus_m
 
         Ax_unit = pm.Normal("Ax_unit", dims=['mode'])
         Ay_unit = pm.Normal("Ay_unit", dims=['mode'])
@@ -290,14 +345,14 @@ def make_mchi_aligned_model(t0, times, strains, Ls, Fps, Fcs, f_coeffs,
              dims=['mode'])
         tau = pm.Deterministic('tau', 1/gamma, dims=['mode'])
         Q = pm.Deterministic('Q', np.pi*f*tau, dims=['mode'])
-        Ap = pm.Deterministic('Ap', (1 + at.square(cosi))*A, dims=['mode'])
-        Ac = pm.Deterministic('Ac', 2*cosi*A, dims=['mode'])
+        Ap = pm.Deterministic('Ap', Ylm_plus*A, dims=['mode'])
+        Ac = pm.Deterministic('Ac', Ylm_cross*A, dims=['mode'])
         ellip = pm.Deterministic('ellip', Ac/Ap, dims=['mode'])
 
-        Apx = (1 + at.square(cosi))*A*at.cos(phi)
-        Apy = (1 + at.square(cosi))*A*at.sin(phi)
-        Acx = -2*cosi*A*at.sin(phi)
-        Acy = 2*cosi*A*at.cos(phi)
+        Apx = Ylm_plus*A*at.cos(phi)
+        Apy = Ylm_plus*A*at.sin(phi)
+        Acx = -Ylm_cross*at.sin(phi)
+        Acy = Ylm_cross*A*at.cos(phi)
 
         h_det_mode = pm.Deterministic("h_det_mode",
             compute_h_det_mode(t0, times, Fps, Fcs, f, gamma,
